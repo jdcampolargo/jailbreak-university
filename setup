@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TIMESTAMP="$(date +%Y%m%d%H%M%S)"
+MODE=""
+TARGET_PATH=""
+HOST="auto"
+TELEMETRY_MODE="disabled"
+TELEMETRY_REMOTE_MODE="disabled"
+TELEMETRY_REMOTE_URL="${JBU_TELEMETRY_REMOTE_URL_DEFAULT:-https://mkgwshineuqvyrojtjeq.supabase.co}"
+TELEMETRY_REMOTE_KEY="${JBU_TELEMETRY_REMOTE_KEY_DEFAULT:-sb_publishable_PxR1GshhJLDqR-bnaaeGpQ_bPjpHE2F}"
+TELEMETRY_REMOTE_FUNCTION="${JBU_TELEMETRY_REMOTE_FUNCTION_DEFAULT:-jbu-telemetry-ingest}"
+
+usage() {
+  cat <<USAGE
+Usage:
+  ./setup --user [--host auto|claude|codex] [--telemetry disabled|enabled] [--telemetry-remote disabled|enabled] [--telemetry-remote-url URL] [--telemetry-remote-key KEY] [--telemetry-remote-function NAME]
+  ./setup --project /absolute/path/to/repo [--host auto|claude|codex] [--telemetry disabled|enabled] [--telemetry-remote disabled|enabled] [--telemetry-remote-url URL] [--telemetry-remote-key KEY] [--telemetry-remote-function NAME]
+USAGE
+}
+
+backup_if_needed() {
+  local target="$1"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    mv "$target" "${target}.bak.${TIMESTAMP}"
+  fi
+}
+
+link_path() {
+  local src="$1"
+  local dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  backup_if_needed "$dst"
+  ln -s "$src" "$dst"
+}
+
+install_claude() {
+  local claude_root="$1"
+  mkdir -p "$claude_root/commands" "$claude_root/skills"
+  link_path "$ROOT/skills" "$claude_root/skills/jailbreak-university"
+  for cmd in "$ROOT"/commands/*.md; do
+    link_path "$cmd" "$claude_root/commands/$(basename "$cmd")"
+  done
+}
+
+install_codex() {
+  local codex_root="$1"
+  mkdir -p "$codex_root/skills"
+  link_path "$ROOT/skills" "$codex_root/skills/jailbreak-university"
+}
+
+install_user_bin() {
+  mkdir -p "$HOME/.local/bin"
+  link_path "$ROOT/bin/jbu-telemetry" "$HOME/.local/bin/jbu-telemetry"
+}
+
+install_project_bin() {
+  local target_root="$1"
+  mkdir -p "$target_root/.jailbreak-university/bin"
+  link_path "$ROOT/bin/jbu-telemetry" "$target_root/.jailbreak-university/bin/jbu-telemetry"
+}
+
+setup_telemetry() {
+  local telemetry_dir="$1"
+  local scope="$2"
+  local target_label="$3"
+  local init_args=(init --dir "$telemetry_dir")
+
+  if [ "$TELEMETRY_MODE" = "enabled" ]; then
+    init_args+=(--enable)
+  fi
+  if [ "$TELEMETRY_REMOTE_MODE" = "enabled" ]; then
+    [ -n "$TELEMETRY_REMOTE_URL" ] || {
+      echo "Remote telemetry needs --telemetry-remote-url or JBU_TELEMETRY_REMOTE_URL_DEFAULT." >&2
+      exit 1
+    }
+    [ -n "$TELEMETRY_REMOTE_KEY" ] || {
+      echo "Remote telemetry needs --telemetry-remote-key or JBU_TELEMETRY_REMOTE_KEY_DEFAULT." >&2
+      exit 1
+    }
+    init_args+=(--remote-enable --remote-url "$TELEMETRY_REMOTE_URL" --remote-key "$TELEMETRY_REMOTE_KEY" --remote-function "$TELEMETRY_REMOTE_FUNCTION")
+  fi
+
+  "$ROOT/bin/jbu-telemetry" "${init_args[@]}"
+  "$ROOT/bin/jbu-telemetry" log --dir "$telemetry_dir" --source setup setup_install "scope=$scope" "host=$HOST" "target=$target_label"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user)
+      MODE="user"
+      shift
+      ;;
+    --project)
+      MODE="project"
+      TARGET_PATH="${2:-}"
+      shift 2
+      ;;
+    --project=*)
+      MODE="project"
+      TARGET_PATH="${1#*=}"
+      shift
+      ;;
+    --host)
+      HOST="${2:-}"
+      shift 2
+      ;;
+    --host=*)
+      HOST="${1#*=}"
+      shift
+      ;;
+    --telemetry)
+      TELEMETRY_MODE="${2:-}"
+      shift 2
+      ;;
+    --telemetry=*)
+      TELEMETRY_MODE="${1#*=}"
+      shift
+      ;;
+    --telemetry-remote)
+      TELEMETRY_REMOTE_MODE="${2:-}"
+      shift 2
+      ;;
+    --telemetry-remote=*)
+      TELEMETRY_REMOTE_MODE="${1#*=}"
+      shift
+      ;;
+    --telemetry-remote-url)
+      TELEMETRY_REMOTE_URL="${2:-}"
+      shift 2
+      ;;
+    --telemetry-remote-url=*)
+      TELEMETRY_REMOTE_URL="${1#*=}"
+      shift
+      ;;
+    --telemetry-remote-key)
+      TELEMETRY_REMOTE_KEY="${2:-}"
+      shift 2
+      ;;
+    --telemetry-remote-key=*)
+      TELEMETRY_REMOTE_KEY="${1#*=}"
+      shift
+      ;;
+    --telemetry-remote-function)
+      TELEMETRY_REMOTE_FUNCTION="${2:-}"
+      shift 2
+      ;;
+    --telemetry-remote-function=*)
+      TELEMETRY_REMOTE_FUNCTION="${1#*=}"
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+case "$HOST" in
+  auto|claude|codex)
+    ;;
+  *)
+    echo "Unknown host: $HOST" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+case "$TELEMETRY_MODE" in
+  disabled|enabled)
+    ;;
+  *)
+    echo "Unknown telemetry mode: $TELEMETRY_MODE" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+case "$TELEMETRY_REMOTE_MODE" in
+  disabled|enabled)
+    ;;
+  *)
+    echo "Unknown remote telemetry mode: $TELEMETRY_REMOTE_MODE" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+if [ -z "$MODE" ]; then
+  usage
+  exit 1
+fi
+
+install_claude_flag=0
+install_codex_flag=0
+case "$HOST" in
+  auto)
+    install_claude_flag=1
+    install_codex_flag=1
+    ;;
+  claude)
+    install_claude_flag=1
+    ;;
+  codex)
+    install_codex_flag=1
+    ;;
+esac
+
+if [ "$MODE" = "user" ]; then
+  if [ "$install_claude_flag" -eq 1 ]; then
+    install_claude "$HOME/.claude"
+  fi
+  if [ "$install_codex_flag" -eq 1 ]; then
+    install_codex "$HOME/.codex"
+  fi
+  install_user_bin
+  setup_telemetry "$HOME/.jailbreak-university/telemetry" "user" "$HOME"
+  echo "Installed jailbreak-university for user scope."
+  exit 0
+fi
+
+if [ -z "$TARGET_PATH" ]; then
+  echo "Missing project path." >&2
+  usage
+  exit 1
+fi
+
+mkdir -p "$TARGET_PATH"
+if [ "$install_claude_flag" -eq 1 ]; then
+  install_claude "$TARGET_PATH/.claude"
+fi
+if [ "$install_codex_flag" -eq 1 ]; then
+  install_codex "$TARGET_PATH/.agents"
+fi
+install_project_bin "$TARGET_PATH"
+setup_telemetry "$TARGET_PATH/.jailbreak-university/telemetry" "project" "$TARGET_PATH"
+
+echo "Installed jailbreak-university into $TARGET_PATH."

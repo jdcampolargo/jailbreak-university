@@ -1,0 +1,1105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE_PATH" ]; do
+  SOURCE_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink "$SOURCE_PATH")"
+  case "$SOURCE_PATH" in
+    /*) ;;
+    *) SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$SOURCE_PATH")/.." && pwd)"
+
+telemetry_dir="${JBU_TELEMETRY_DIR:-$HOME/.jailbreak-university/telemetry}"
+config_file=""
+events_file=""
+remote_sync_file=""
+config_exists=0
+REMOTE_URL_DEFAULT="${JBU_TELEMETRY_REMOTE_URL_DEFAULT:-https://mkgwshineuqvyrojtjeq.supabase.co}"
+REMOTE_KEY_DEFAULT="${JBU_TELEMETRY_REMOTE_KEY_DEFAULT:-sb_publishable_PxR1GshhJLDqR-bnaaeGpQ_bPjpHE2F}"
+REMOTE_FUNCTION_DEFAULT="${JBU_TELEMETRY_REMOTE_FUNCTION_DEFAULT:-jbu-telemetry-ingest}"
+
+JBU_TELEMETRY_ENABLED=0
+JBU_TELEMETRY_CREATED_AT=""
+JBU_TELEMETRY_UPDATED_AT=""
+JBU_TELEMETRY_INSTANCE_ID=""
+JBU_TELEMETRY_REPO_ROOT="$ROOT"
+JBU_TELEMETRY_REMOTE_ENABLED=0
+JBU_TELEMETRY_REMOTE_URL="$REMOTE_URL_DEFAULT"
+JBU_TELEMETRY_REMOTE_KEY="$REMOTE_KEY_DEFAULT"
+JBU_TELEMETRY_REMOTE_FUNCTION="$REMOTE_FUNCTION_DEFAULT"
+JBU_TELEMETRY_REMOTE_LAST_SYNC_AT=""
+JBU_TELEMETRY_REMOTE_LAST_SYNC_STATUS=""
+
+usage() {
+  cat <<USAGE
+Usage:
+  $SCRIPT_NAME init [--dir PATH] [--enable|--disable] [--remote-enable|--remote-disable] [--remote-url URL] [--remote-key KEY] [--remote-function NAME]
+  $SCRIPT_NAME enable [--dir PATH]
+  $SCRIPT_NAME disable [--dir PATH]
+  $SCRIPT_NAME remote-enable [--dir PATH] [--url URL] [--key KEY] [--function NAME]
+  $SCRIPT_NAME remote-disable [--dir PATH]
+  $SCRIPT_NAME status [--dir PATH]
+  $SCRIPT_NAME log [--dir PATH] [--source NAME] EVENT [key=value ...]
+  $SCRIPT_NAME dashboard [--dir PATH] [--limit N]
+  $SCRIPT_NAME sync [--dir PATH] [--url URL] [--key KEY] [--function NAME] [--batch-size N] [--dry-run]
+
+Defaults:
+  telemetry dir: \$JBU_TELEMETRY_DIR or $HOME/.jailbreak-university/telemetry
+  remote url default: \$JBU_TELEMETRY_REMOTE_URL_DEFAULT
+  remote key default: \$JBU_TELEMETRY_REMOTE_KEY_DEFAULT
+  remote function default: \$JBU_TELEMETRY_REMOTE_FUNCTION_DEFAULT or jbu-telemetry-ingest
+
+Notes:
+  - Local telemetry always stays on disk in config.env plus events.tsv.
+  - Remote sync is separate, explicit opt-in, and default-off.
+  - sync sends only occurred_at, event_name, source_name, instance_digest, and event_digest.
+  - sync never sends payload, repo_root, prompts, file paths, repo names, branch names, or user content.
+USAGE
+}
+
+die() {
+  echo "$SCRIPT_NAME: $*" >&2
+  exit 1
+}
+
+now_utc() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+normalize_dir() {
+  local value="${1:-}"
+  case "$value" in
+    "")
+      die "Missing telemetry directory."
+      ;;
+    "~")
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s\n' "$HOME/${value#~/}"
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+sanitize_field() {
+  printf '%s' "$1" | tr '\t\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ +//; s/ +$//'
+}
+
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
+}
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+refresh_paths() {
+  config_file="$telemetry_dir/config.env"
+  events_file="$telemetry_dir/events.tsv"
+  remote_sync_file="$telemetry_dir/remote-sync.tsv"
+}
+
+ensure_dir() {
+  mkdir -p "$telemetry_dir"
+  refresh_paths
+}
+
+ensure_events_file() {
+  ensure_dir
+  if [ ! -f "$events_file" ]; then
+    printf 'timestamp\tevent\tsource\tinstance_id\trepo_root\tpayload\n' > "$events_file"
+  fi
+}
+
+ensure_remote_sync_file() {
+  ensure_dir
+  if [ ! -f "$remote_sync_file" ]; then
+    printf 'event_digest\tsynced_at\n' > "$remote_sync_file"
+  fi
+}
+
+load_config() {
+  refresh_paths
+  config_exists=0
+  JBU_TELEMETRY_ENABLED=0
+  JBU_TELEMETRY_CREATED_AT=""
+  JBU_TELEMETRY_UPDATED_AT=""
+  JBU_TELEMETRY_INSTANCE_ID=""
+  JBU_TELEMETRY_REPO_ROOT="$ROOT"
+  JBU_TELEMETRY_REMOTE_ENABLED=0
+  JBU_TELEMETRY_REMOTE_URL=""
+  JBU_TELEMETRY_REMOTE_KEY=""
+  JBU_TELEMETRY_REMOTE_FUNCTION="$REMOTE_FUNCTION_DEFAULT"
+  JBU_TELEMETRY_REMOTE_LAST_SYNC_AT=""
+  JBU_TELEMETRY_REMOTE_LAST_SYNC_STATUS=""
+
+  if [ -f "$config_file" ]; then
+    config_exists=1
+    # shellcheck disable=SC1090
+    . "$config_file"
+  fi
+}
+
+save_config() {
+  local now
+  now="$(now_utc)"
+
+  [ -n "$JBU_TELEMETRY_CREATED_AT" ] || JBU_TELEMETRY_CREATED_AT="$now"
+  [ -n "$JBU_TELEMETRY_INSTANCE_ID" ] || JBU_TELEMETRY_INSTANCE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  [ -n "$JBU_TELEMETRY_REPO_ROOT" ] || JBU_TELEMETRY_REPO_ROOT="$ROOT"
+  [ -n "$JBU_TELEMETRY_REMOTE_FUNCTION" ] || JBU_TELEMETRY_REMOTE_FUNCTION="jbu-telemetry-ingest"
+  JBU_TELEMETRY_UPDATED_AT="$now"
+
+  ensure_dir
+  cat > "$config_file" <<EOF_CONFIG
+# Jailbreak University telemetry.
+# Local logging stays on disk. Remote sync is explicit opt-in and sends only a minimal safe envelope.
+JBU_TELEMETRY_ENABLED=$JBU_TELEMETRY_ENABLED
+JBU_TELEMETRY_CREATED_AT=$(shell_quote "$JBU_TELEMETRY_CREATED_AT")
+JBU_TELEMETRY_UPDATED_AT=$(shell_quote "$JBU_TELEMETRY_UPDATED_AT")
+JBU_TELEMETRY_INSTANCE_ID=$(shell_quote "$JBU_TELEMETRY_INSTANCE_ID")
+JBU_TELEMETRY_REPO_ROOT=$(shell_quote "$JBU_TELEMETRY_REPO_ROOT")
+JBU_TELEMETRY_REMOTE_ENABLED=$JBU_TELEMETRY_REMOTE_ENABLED
+JBU_TELEMETRY_REMOTE_URL=$(shell_quote "$JBU_TELEMETRY_REMOTE_URL")
+JBU_TELEMETRY_REMOTE_KEY=$(shell_quote "$JBU_TELEMETRY_REMOTE_KEY")
+JBU_TELEMETRY_REMOTE_FUNCTION=$(shell_quote "$JBU_TELEMETRY_REMOTE_FUNCTION")
+JBU_TELEMETRY_REMOTE_LAST_SYNC_AT=$(shell_quote "$JBU_TELEMETRY_REMOTE_LAST_SYNC_AT")
+JBU_TELEMETRY_REMOTE_LAST_SYNC_STATUS=$(shell_quote "$JBU_TELEMETRY_REMOTE_LAST_SYNC_STATUS")
+EOF_CONFIG
+  ensure_events_file
+  ensure_remote_sync_file
+}
+
+append_event() {
+  local event_name source_name payload timestamp instance repo_root
+  event_name="$(sanitize_field "$1")"
+  source_name="$(sanitize_field "$2")"
+  payload="$(sanitize_field "$3")"
+  timestamp="$(now_utc)"
+  instance="$(sanitize_field "${JBU_TELEMETRY_INSTANCE_ID:-unknown}")"
+  repo_root="$(sanitize_field "${JBU_TELEMETRY_REPO_ROOT:-$ROOT}")"
+  ensure_events_file
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(sanitize_field "$timestamp")" \
+    "$event_name" \
+    "$source_name" \
+    "$instance" \
+    "$repo_root" \
+    "$payload" >> "$events_file"
+}
+
+count_events() {
+  if [ ! -f "$events_file" ]; then
+    echo 0
+    return
+  fi
+  awk 'NR > 1 && NF > 0 { count++ } END { print count + 0 }' "$events_file"
+}
+
+count_synced_events() {
+  if [ ! -f "$remote_sync_file" ]; then
+    echo 0
+    return
+  fi
+  awk 'NR > 1 && NF > 0 { count++ } END { print count + 0 }' "$remote_sync_file"
+}
+
+count_pending_remote_events() {
+  local total synced pending
+  total="$(count_events)"
+  synced="$(count_synced_events)"
+  pending=$((total - synced))
+  if [ "$pending" -lt 0 ]; then
+    pending=0
+  fi
+  echo "$pending"
+}
+
+print_count_table() {
+  local column="$1"
+  local heading="$2"
+  local limit="$3"
+  local lines
+
+  echo "$heading"
+  lines="$(awk -F '\t' -v column="$column" 'NR > 1 && $column != "" { count[$column]++ } END { for (key in count) printf "%s\t%s\n", count[key], key }' "$events_file" | sort -nr | head -n "$limit")"
+  if [ -z "$lines" ]; then
+    echo "  none"
+    return
+  fi
+
+  printf '%s\n' "$lines" | awk -F '\t' '{ printf "  %-5s %s\n", $1, $2 }'
+}
+
+print_recent_events() {
+  local limit="$1"
+  local lines
+
+  echo "recent events:"
+  lines="$(awk -F '\t' 'NR > 1 && NF > 0 { print $1 "\t" $2 "\t" $3 "\t" $6 }' "$events_file" | tail -n "$limit")"
+  if [ -z "$lines" ]; then
+    echo "  none"
+    return
+  fi
+
+  printf '%s\n' "$lines" | awk -F '\t' '{
+    printf "  %s  %s  source=%s", $1, $2, $3;
+    if ($4 != "") {
+      printf "  %s", $4;
+    }
+    print "";
+  }'
+}
+
+is_positive_int() {
+  case "$1" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    0)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+normalize_safe_name() {
+  local raw lower fallback
+  raw="$1"
+  fallback="$2"
+  lower="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  if printf '%s' "$lower" | grep -Eq '^[a-z0-9][a-z0-9_.-]{0,63}$'; then
+    printf '%s\n' "$lower"
+    return
+  fi
+  printf '%s\n' "$fallback"
+}
+
+validate_remote_function_name() {
+  local name
+  name="$1"
+  if printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_.-]{0,63}$'; then
+    return 0
+  fi
+  return 1
+}
+
+validate_remote_url() {
+  case "$1" in
+    http://*|https://*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+hash_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'
+    return
+  fi
+  die "Need shasum, sha256sum, or openssl to hash telemetry events."
+}
+
+remote_digest_exists() {
+  local digest="$1"
+  if [ ! -f "$remote_sync_file" ]; then
+    return 1
+  fi
+  awk -F '\t' -v digest="$digest" 'NR > 1 && $1 == digest { found = 1 } END { exit(found ? 0 : 1) }' "$remote_sync_file"
+}
+
+build_remote_endpoint() {
+  local base
+  base="${JBU_TELEMETRY_REMOTE_URL%/}"
+  printf '%s/functions/v1/%s\n' "$base" "$JBU_TELEMETRY_REMOTE_FUNCTION"
+}
+
+set_last_sync_status() {
+  JBU_TELEMETRY_REMOTE_LAST_SYNC_AT="$(now_utc)"
+  JBU_TELEMETRY_REMOTE_LAST_SYNC_STATUS="$1"
+  save_config
+}
+
+mktemp_file() {
+  mktemp "${TMPDIR:-/tmp}/jbu-telemetry.XXXXXX"
+}
+
+build_sync_batch() {
+  local batch_size="$1"
+  local events_json_file="$2"
+  local digest_file="$3"
+  local count=0
+  local timestamp event_name source_name instance_id repo_root payload
+  local safe_event safe_source instance_digest event_digest
+
+  : > "$events_json_file"
+  : > "$digest_file"
+  ensure_events_file
+  ensure_remote_sync_file
+
+  while IFS=$'\t' read -r timestamp event_name source_name instance_id repo_root payload; do
+    [ -n "$timestamp" ] || continue
+    event_digest="$(hash_sha256 "$timestamp|$event_name|$source_name|$instance_id")"
+    if remote_digest_exists "$event_digest"; then
+      continue
+    fi
+    safe_event="$(normalize_safe_name "$event_name" "custom_event")"
+    safe_source="$(normalize_safe_name "$source_name" "custom_source")"
+    instance_digest="$(hash_sha256 "$instance_id")"
+
+    printf '%s\n' "{\"occurred_at\":\"$(json_escape "$timestamp")\",\"event_name\":\"$(json_escape "$safe_event")\",\"source_name\":\"$(json_escape "$safe_source")\",\"instance_digest\":\"$instance_digest\",\"event_digest\":\"$event_digest\"}" >> "$events_json_file"
+    printf '%s\n' "$event_digest" >> "$digest_file"
+
+    count=$((count + 1))
+    if [ "$count" -ge "$batch_size" ]; then
+      break
+    fi
+  done < <(tail -n +2 "$events_file")
+
+  echo "$count"
+}
+
+build_payload_file() {
+  local events_json_file="$1"
+  local payload_file="$2"
+  {
+    printf '{"schema_version":1,"client":"jbu-telemetry","events":['
+    awk 'BEGIN { first = 1 } { if (!first) printf ","; printf "%s", $0; first = 0 }' "$events_json_file"
+    printf ']}\n'
+  } > "$payload_file"
+}
+
+append_synced_digests() {
+  local digest_file="$1"
+  local synced_at
+  local digest
+  synced_at="$(now_utc)"
+  ensure_remote_sync_file
+  while IFS= read -r digest; do
+    [ -n "$digest" ] || continue
+    printf '%s\t%s\n' "$digest" "$synced_at" >> "$remote_sync_file"
+  done < "$digest_file"
+}
+
+print_remote_status() {
+  local url_state key_state
+  url_state="missing"
+  key_state="missing"
+  if [ -n "$JBU_TELEMETRY_REMOTE_URL" ]; then
+    url_state="configured"
+  fi
+  if [ -n "$JBU_TELEMETRY_REMOTE_KEY" ]; then
+    key_state="configured"
+  fi
+
+  echo "remote sync: $( [ "$JBU_TELEMETRY_REMOTE_ENABLED" -eq 1 ] && printf 'enabled' || printf 'disabled' )"
+  echo "remote url: $url_state"
+  echo "remote key: $key_state"
+  echo "remote function: ${JBU_TELEMETRY_REMOTE_FUNCTION:-jbu-telemetry-ingest}"
+  echo "remote pending: $(count_pending_remote_events)"
+  echo "remote last sync: ${JBU_TELEMETRY_REMOTE_LAST_SYNC_AT:-never}"
+  echo "remote last status: ${JBU_TELEMETRY_REMOTE_LAST_SYNC_STATUS:-n/a}"
+}
+
+cmd_init() {
+  local desired_state=""
+  local desired_remote_state=""
+  local remote_url_override=""
+  local remote_key_override=""
+  local remote_function_override=""
+  local was_initialized was_enabled was_remote_enabled
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --enable)
+        desired_state="1"
+        shift
+        ;;
+      --disable)
+        desired_state="0"
+        shift
+        ;;
+      --remote-enable)
+        desired_remote_state="1"
+        shift
+        ;;
+      --remote-disable)
+        desired_remote_state="0"
+        shift
+        ;;
+      --remote-url)
+        [ $# -ge 2 ] || die "Missing value for --remote-url."
+        remote_url_override="$2"
+        shift 2
+        ;;
+      --remote-url=*)
+        remote_url_override="${1#*=}"
+        shift
+        ;;
+      --remote-key)
+        [ $# -ge 2 ] || die "Missing value for --remote-key."
+        remote_key_override="$2"
+        shift 2
+        ;;
+      --remote-key=*)
+        remote_key_override="${1#*=}"
+        shift
+        ;;
+      --remote-function)
+        [ $# -ge 2 ] || die "Missing value for --remote-function."
+        remote_function_override="$2"
+        shift 2
+        ;;
+      --remote-function=*)
+        remote_function_override="${1#*=}"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown init option: $1"
+        ;;
+    esac
+  done
+
+  refresh_paths
+  load_config
+  was_initialized="$config_exists"
+  was_enabled="$JBU_TELEMETRY_ENABLED"
+  was_remote_enabled="$JBU_TELEMETRY_REMOTE_ENABLED"
+
+  if [ "$was_initialized" -eq 0 ]; then
+    JBU_TELEMETRY_ENABLED=0
+    JBU_TELEMETRY_REMOTE_ENABLED=0
+  fi
+  if [ -n "$desired_state" ]; then
+    JBU_TELEMETRY_ENABLED="$desired_state"
+  fi
+  if [ -n "$desired_remote_state" ]; then
+    JBU_TELEMETRY_REMOTE_ENABLED="$desired_remote_state"
+  fi
+  if [ -n "$remote_url_override" ]; then
+    JBU_TELEMETRY_REMOTE_URL="$remote_url_override"
+  fi
+  if [ -n "$remote_key_override" ]; then
+    JBU_TELEMETRY_REMOTE_KEY="$remote_key_override"
+  fi
+  if [ -n "$remote_function_override" ]; then
+    JBU_TELEMETRY_REMOTE_FUNCTION="$remote_function_override"
+  fi
+
+  if [ "$JBU_TELEMETRY_REMOTE_ENABLED" -eq 1 ]; then
+    [ -n "$JBU_TELEMETRY_REMOTE_URL" ] || JBU_TELEMETRY_REMOTE_URL="$REMOTE_URL_DEFAULT"
+    [ -n "$JBU_TELEMETRY_REMOTE_KEY" ] || JBU_TELEMETRY_REMOTE_KEY="$REMOTE_KEY_DEFAULT"
+    validate_remote_url "$JBU_TELEMETRY_REMOTE_URL" || die "Remote URL must start with http:// or https://."
+    [ -n "$JBU_TELEMETRY_REMOTE_KEY" ] || die "Remote key is required when remote sync is enabled."
+    validate_remote_function_name "$JBU_TELEMETRY_REMOTE_FUNCTION" || die "Remote function name must match ^[a-z0-9][a-z0-9_.-]{0,63}$."
+  fi
+
+  save_config
+  if [ "$JBU_TELEMETRY_ENABLED" -eq 1 ] && { [ "$was_initialized" -eq 0 ] || [ "$was_enabled" -ne 1 ]; }; then
+    append_event "telemetry_enabled" "init" "mode=enabled"
+  fi
+  if [ "$JBU_TELEMETRY_ENABLED" -eq 1 ] && [ "$JBU_TELEMETRY_REMOTE_ENABLED" -eq 1 ] && { [ "$was_initialized" -eq 0 ] || [ "$was_remote_enabled" -ne 1 ]; }; then
+    append_event "telemetry_remote_enabled" "init" "mode=remote-enable"
+  fi
+
+  echo "Telemetry initialized at $telemetry_dir (enabled=$JBU_TELEMETRY_ENABLED, remote=$JBU_TELEMETRY_REMOTE_ENABLED)."
+}
+
+cmd_enable() {
+  local was_enabled=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown enable option: $1"
+        ;;
+    esac
+  done
+
+  refresh_paths
+  load_config
+  was_enabled="$JBU_TELEMETRY_ENABLED"
+  JBU_TELEMETRY_ENABLED=1
+  save_config
+  if [ "$was_enabled" -ne 1 ]; then
+    append_event "telemetry_enabled" "manual" "mode=enable"
+  fi
+
+  echo "Telemetry enabled at $telemetry_dir."
+}
+
+cmd_disable() {
+  local was_enabled=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown disable option: $1"
+        ;;
+    esac
+  done
+
+  refresh_paths
+  load_config
+  was_enabled="$JBU_TELEMETRY_ENABLED"
+  if [ "$was_enabled" -eq 1 ]; then
+    append_event "telemetry_disabled" "manual" "mode=disable"
+  fi
+  JBU_TELEMETRY_ENABLED=0
+  save_config
+
+  echo "Telemetry disabled at $telemetry_dir."
+}
+
+cmd_remote_enable() {
+  local remote_url_override=""
+  local remote_key_override=""
+  local remote_function_override=""
+  local was_remote_enabled=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --url)
+        [ $# -ge 2 ] || die "Missing value for --url."
+        remote_url_override="$2"
+        shift 2
+        ;;
+      --url=*)
+        remote_url_override="${1#*=}"
+        shift
+        ;;
+      --key)
+        [ $# -ge 2 ] || die "Missing value for --key."
+        remote_key_override="$2"
+        shift 2
+        ;;
+      --key=*)
+        remote_key_override="${1#*=}"
+        shift
+        ;;
+      --function)
+        [ $# -ge 2 ] || die "Missing value for --function."
+        remote_function_override="$2"
+        shift 2
+        ;;
+      --function=*)
+        remote_function_override="${1#*=}"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown remote-enable option: $1"
+        ;;
+    esac
+  done
+
+  refresh_paths
+  load_config
+  was_remote_enabled="$JBU_TELEMETRY_REMOTE_ENABLED"
+  if [ -n "$remote_url_override" ]; then
+    JBU_TELEMETRY_REMOTE_URL="$remote_url_override"
+  fi
+  if [ -n "$remote_key_override" ]; then
+    JBU_TELEMETRY_REMOTE_KEY="$remote_key_override"
+  fi
+  if [ -n "$remote_function_override" ]; then
+    JBU_TELEMETRY_REMOTE_FUNCTION="$remote_function_override"
+  fi
+
+  [ -n "$JBU_TELEMETRY_REMOTE_URL" ] || JBU_TELEMETRY_REMOTE_URL="$REMOTE_URL_DEFAULT"
+  [ -n "$JBU_TELEMETRY_REMOTE_KEY" ] || JBU_TELEMETRY_REMOTE_KEY="$REMOTE_KEY_DEFAULT"
+  validate_remote_url "$JBU_TELEMETRY_REMOTE_URL" || die "Remote URL must start with http:// or https://."
+  [ -n "$JBU_TELEMETRY_REMOTE_KEY" ] || die "Remote key is required when enabling remote sync."
+  validate_remote_function_name "$JBU_TELEMETRY_REMOTE_FUNCTION" || die "Remote function name must match ^[a-z0-9][a-z0-9_.-]{0,63}$."
+
+  JBU_TELEMETRY_REMOTE_ENABLED=1
+  save_config
+  if [ "$was_remote_enabled" -ne 1 ] && [ "$JBU_TELEMETRY_ENABLED" -eq 1 ]; then
+    append_event "telemetry_remote_enabled" "manual" "mode=remote-enable"
+  fi
+
+  echo "Remote telemetry enabled at $telemetry_dir."
+}
+
+cmd_remote_disable() {
+  local was_remote_enabled=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown remote-disable option: $1"
+        ;;
+    esac
+  done
+
+  refresh_paths
+  load_config
+  was_remote_enabled="$JBU_TELEMETRY_REMOTE_ENABLED"
+  JBU_TELEMETRY_REMOTE_ENABLED=0
+  save_config
+  if [ "$was_remote_enabled" -eq 1 ] && [ "$JBU_TELEMETRY_ENABLED" -eq 1 ]; then
+    append_event "telemetry_remote_disabled" "manual" "mode=remote-disable"
+  fi
+
+  echo "Remote telemetry disabled at $telemetry_dir."
+}
+
+cmd_status() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown status option: $1"
+        ;;
+    esac
+  done
+
+  refresh_paths
+  load_config
+  echo "Telemetry status"
+  echo "dir: $telemetry_dir"
+  echo "config: $config_file"
+  echo "events: $events_file"
+  echo "sync state: $remote_sync_file"
+  if [ "$config_exists" -eq 0 ]; then
+    echo "state: not initialized"
+    echo "events logged: 0"
+    echo "remote sync: disabled"
+    echo "remote pending: 0"
+    return
+  fi
+  echo "state: $( [ "$JBU_TELEMETRY_ENABLED" -eq 1 ] && printf 'enabled' || printf 'disabled' )"
+  echo "instance: ${JBU_TELEMETRY_INSTANCE_ID:-unknown}"
+  echo "repo root: ${JBU_TELEMETRY_REPO_ROOT:-$ROOT}"
+  echo "events logged: $(count_events)"
+  print_remote_status
+}
+
+cmd_log() {
+  local source_name="manual"
+  local event_name=""
+  local payload=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --source)
+        [ $# -ge 2 ] || die "Missing value for --source."
+        source_name="$2"
+        shift 2
+        ;;
+      --source=*)
+        source_name="${1#*=}"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown log option: $1"
+        ;;
+      *)
+        event_name="$1"
+        shift
+        break
+        ;;
+    esac
+  done
+
+  [ -n "$event_name" ] || die "Missing event name."
+
+  refresh_paths
+  load_config
+  if [ "$config_exists" -eq 0 ] || [ "$JBU_TELEMETRY_ENABLED" -ne 1 ]; then
+    exit 0
+  fi
+
+  for item in "$@"; do
+    [ -n "$item" ] || continue
+    if [ -n "$payload" ]; then
+      payload="${payload};"
+    fi
+    payload="${payload}$(sanitize_field "$item")"
+  done
+
+  append_event "$event_name" "$source_name" "$payload"
+}
+
+cmd_dashboard() {
+  local limit=10
+  local total_events
+  local range
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --limit)
+        [ $# -ge 2 ] || die "Missing value for --limit."
+        limit="$2"
+        shift 2
+        ;;
+      --limit=*)
+        limit="${1#*=}"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown dashboard option: $1"
+        ;;
+    esac
+  done
+
+  is_positive_int "$limit" || die "--limit must be a positive integer."
+
+  refresh_paths
+  load_config
+
+  echo "Jailbreak University telemetry dashboard"
+  echo "dir: $telemetry_dir"
+  if [ "$config_exists" -eq 0 ]; then
+    echo "state: not initialized"
+    echo "next step: $SCRIPT_NAME init --dir $telemetry_dir"
+    return
+  fi
+
+  ensure_events_file
+  ensure_remote_sync_file
+  total_events="$(count_events)"
+  range="$(awk -F '\t' 'NR == 2 { first = $1 } NR > 1 && NF > 0 { last = $1 } END { if (first == "") print "n/a"; else print first " -> " last }' "$events_file")"
+
+  echo "state: $( [ "$JBU_TELEMETRY_ENABLED" -eq 1 ] && printf 'enabled' || printf 'disabled' )"
+  echo "config: $config_file"
+  echo "events: $events_file"
+  echo "sync state: $remote_sync_file"
+  echo "total events: $total_events"
+  echo "range: $range"
+  print_remote_status
+  print_count_table 2 "top events:" "$limit"
+  print_count_table 3 "top sources:" "$limit"
+  print_recent_events "$limit"
+}
+
+cmd_sync() {
+  local remote_url_override=""
+  local remote_key_override=""
+  local remote_function_override=""
+  local batch_size=50
+  local dry_run=0
+  local endpoint
+  local payload_file events_json_file digest_file response_file
+  local batch_count total_synced=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)
+        [ $# -ge 2 ] || die "Missing value for --dir."
+        telemetry_dir="$(normalize_dir "$2")"
+        shift 2
+        ;;
+      --dir=*)
+        telemetry_dir="$(normalize_dir "${1#*=}")"
+        shift
+        ;;
+      --url)
+        [ $# -ge 2 ] || die "Missing value for --url."
+        remote_url_override="$2"
+        shift 2
+        ;;
+      --url=*)
+        remote_url_override="${1#*=}"
+        shift
+        ;;
+      --key)
+        [ $# -ge 2 ] || die "Missing value for --key."
+        remote_key_override="$2"
+        shift 2
+        ;;
+      --key=*)
+        remote_key_override="${1#*=}"
+        shift
+        ;;
+      --function)
+        [ $# -ge 2 ] || die "Missing value for --function."
+        remote_function_override="$2"
+        shift 2
+        ;;
+      --function=*)
+        remote_function_override="${1#*=}"
+        shift
+        ;;
+      --batch-size)
+        [ $# -ge 2 ] || die "Missing value for --batch-size."
+        batch_size="$2"
+        shift 2
+        ;;
+      --batch-size=*)
+        batch_size="${1#*=}"
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown sync option: $1"
+        ;;
+    esac
+  done
+
+  is_positive_int "$batch_size" || die "--batch-size must be a positive integer."
+
+  refresh_paths
+  load_config
+  if [ "$config_exists" -eq 0 ]; then
+    echo "Telemetry is not initialized."
+    return
+  fi
+
+  if [ -n "$remote_url_override" ]; then
+    JBU_TELEMETRY_REMOTE_URL="$remote_url_override"
+  fi
+  if [ -n "$remote_key_override" ]; then
+    JBU_TELEMETRY_REMOTE_KEY="$remote_key_override"
+  fi
+  if [ -n "$remote_function_override" ]; then
+    JBU_TELEMETRY_REMOTE_FUNCTION="$remote_function_override"
+  fi
+
+  [ -n "$JBU_TELEMETRY_REMOTE_URL" ] || JBU_TELEMETRY_REMOTE_URL="$REMOTE_URL_DEFAULT"
+  [ -n "$JBU_TELEMETRY_REMOTE_KEY" ] || JBU_TELEMETRY_REMOTE_KEY="$REMOTE_KEY_DEFAULT"
+  if [ "$JBU_TELEMETRY_REMOTE_ENABLED" -ne 1 ]; then
+    echo "Remote telemetry is disabled."
+    return
+  fi
+  validate_remote_url "$JBU_TELEMETRY_REMOTE_URL" || die "Remote URL must start with http:// or https://."
+  [ -n "$JBU_TELEMETRY_REMOTE_KEY" ] || die "Remote key is required when syncing remote telemetry."
+  validate_remote_function_name "$JBU_TELEMETRY_REMOTE_FUNCTION" || die "Remote function name must match ^[a-z0-9][a-z0-9_.-]{0,63}$."
+
+  ensure_events_file
+  ensure_remote_sync_file
+  if [ "$(count_pending_remote_events)" -eq 0 ]; then
+    echo "No pending remote telemetry events."
+    return
+  fi
+
+  if [ "$dry_run" -ne 1 ] && ! command -v curl >/dev/null 2>&1; then
+    die "curl is required for remote sync."
+  fi
+
+  endpoint="$(build_remote_endpoint)"
+  payload_file="$(mktemp_file)"
+  events_json_file="$(mktemp_file)"
+  digest_file="$(mktemp_file)"
+  response_file="$(mktemp_file)"
+
+  while :; do
+    batch_count="$(build_sync_batch "$batch_size" "$events_json_file" "$digest_file")"
+    if [ "$batch_count" -eq 0 ]; then
+      break
+    fi
+
+    build_payload_file "$events_json_file" "$payload_file"
+
+    if [ "$dry_run" -eq 1 ]; then
+      echo "Remote telemetry dry run"
+      echo "endpoint: $endpoint"
+      cat "$payload_file"
+      rm -f "$payload_file" "$events_json_file" "$digest_file" "$response_file"
+      return
+    fi
+
+    if ! curl -fsS -X POST "$endpoint" \
+      -H "Content-Type: application/json" \
+      -H "apikey: $JBU_TELEMETRY_REMOTE_KEY" \
+      -H "Authorization: Bearer $JBU_TELEMETRY_REMOTE_KEY" \
+      --data @"$payload_file" > "$response_file"; then
+      rm -f "$payload_file" "$events_json_file" "$digest_file" "$response_file"
+      set_last_sync_status "failed:$total_synced"
+      die "Remote sync failed after $total_synced event(s)."
+    fi
+
+    append_synced_digests "$digest_file"
+    total_synced=$((total_synced + batch_count))
+  done
+
+  rm -f "$payload_file" "$events_json_file" "$digest_file" "$response_file"
+
+  if [ "$total_synced" -eq 0 ]; then
+    echo "No pending remote telemetry events."
+    return
+  fi
+
+  set_last_sync_status "ok:$total_synced"
+  echo "Synced $total_synced event(s) to remote telemetry."
+}
+
+main() {
+  local command="${1:-}"
+  if [ $# -eq 0 ]; then
+    usage
+    exit 0
+  fi
+  shift
+
+  case "$command" in
+    init)
+      cmd_init "$@"
+      ;;
+    enable)
+      cmd_enable "$@"
+      ;;
+    disable)
+      cmd_disable "$@"
+      ;;
+    remote-enable)
+      cmd_remote_enable "$@"
+      ;;
+    remote-disable)
+      cmd_remote_disable "$@"
+      ;;
+    status)
+      cmd_status "$@"
+      ;;
+    log)
+      cmd_log "$@"
+      ;;
+    dashboard)
+      cmd_dashboard "$@"
+      ;;
+    sync)
+      cmd_sync "$@"
+      ;;
+    --help|-h|help)
+      usage
+      ;;
+    *)
+      die "Unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

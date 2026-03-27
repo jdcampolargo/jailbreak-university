@@ -1,0 +1,4 @@
+project_id = "mkgwshineuqvyrojtjeq"
+
+[functions.jbu-telemetry-ingest]
+verify_jwt = false

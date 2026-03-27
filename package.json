@@ -1,0 +1,35 @@
+{
+  "name": "jailbreak-university",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A student operating system skill pack for Codex, Claude Code, and other agentic assistants.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "sync": "node scripts/sync_agents.mjs",
+    "validate": "node scripts/validate_repo.mjs",
+    "supabase:login": "npx supabase login",
+    "supabase:link": "npx supabase link --project-ref mkgwshineuqvyrojtjeq",
+    "supabase:start": "npx supabase start",
+    "supabase:stop": "npx supabase stop",
+    "supabase:status": "npx supabase status",
+    "supabase:db:push": "npx supabase db push",
+    "supabase:functions:serve": "npx supabase functions serve jbu-telemetry-ingest --no-verify-jwt",
+    "supabase:functions:deploy": "npx supabase functions deploy jbu-telemetry-ingest --no-verify-jwt",
+    "supabase:deploy:telemetry": "npm run supabase:db:push && npm run supabase:functions:deploy",
+    "telemetry:init": "./bin/jbu-telemetry init",
+    "telemetry:enable": "./bin/jbu-telemetry enable",
+    "telemetry:disable": "./bin/jbu-telemetry disable",
+    "telemetry:remote-enable": "./bin/jbu-telemetry remote-enable",
+    "telemetry:remote-disable": "./bin/jbu-telemetry remote-disable",
+    "telemetry:status": "./bin/jbu-telemetry status",
+    "telemetry:log": "./bin/jbu-telemetry log",
+    "telemetry:dashboard": "./bin/jbu-telemetry dashboard",
+    "telemetry:sync": "./bin/jbu-telemetry sync"
+  },
+  "devDependencies": {
+    "supabase": "^2.84.4"
+  }
+}
